@@ -1,23 +1,30 @@
 import os
 import io
 import re
+import random
 import numpy as np
 from scipy.io import wavfile
 import librosa
 from flask import Flask, request, send_file, render_template_string
 
+# ==============================================================================
+# CONFIGURATION DES CHEMINS (Adaptés pour un dépôt GitHub / Serveur)
+# ==============================================================================
+# Les chemins sont maintenant relatifs au dossier où se trouve app.py
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VOICES_DIR_BOY = os.path.join(BASE_DIR, "voices", "BOY")
 VOICES_DIR_GIRL = os.path.join(BASE_DIR, "voices", "GIRL")
 
 # Paramètres de rythme
 SPEED_FAST = 1.75
-SPEED_SLOW = 0.6
-OVERLAP_FACTOR = 0.5
+SPEED_SLOW = 2.2
+OVERLAP_FACTOR = 0.5  # Utilisé uniquement pour le mode rapide
 SPACE_DURATION_SECS = 0.015
-PUNC_DURATION_SECS = 0.08
+PUNC_DURATION_SECS = 0.05
 
-
+# ==============================================================================
+# BASE DE DONNÉES DES PERSONNAGES
+# ==============================================================================
 CHARACTERS = {
     "Tom Nook": {"pitch": 1.11, "gender": "boy"},
     "Amiral": {"pitch": 1.05, "gender": "boy"},
@@ -51,13 +58,26 @@ CHARACTERS = {
     "Shaki": {"pitch": 1.00, "gender": "girl"}
 }
 
+# ==============================================================================
+# FONCTIONS AUDIO
+# ==============================================================================
+
+PHONETIC_FALLBACKS = {
+    'c': 'k', 'f': 'v', 'h': 'a', 'j': 'g', 'q': 'k', 'r': 'l', 
+    'w': 'v', 'x': 'k', 'z': 's', 'p': 'b', 't': 'd',
+    'é': 'e', 'è': 'e', 'ê': 'e', 'à': 'a', 'ù': 'u', 'ç': 's',
+    'u': 'o'
+}
+
+VOWELS = set("aeiouyàâäéèêëîïôöùûü")
+
+def has_vowel(phoneme_str):
+    return any(c in VOWELS for c in phoneme_str)
 
 def load_phoneme_libraries(target_sr=44100):
-    """ Charge séparément les dossiers BOY et GIRL en RAM """
     libraries = {'boy': {}, 'girl': {}}
     valid_extensions = ('.wav', '.ogg', '.mp3', '.flac')
     
-    # Chargement Bibliothèque Garçons
     if os.path.exists(VOICES_DIR_BOY):
         for file in os.listdir(VOICES_DIR_BOY):
             if file.lower().endswith(valid_extensions):
@@ -67,9 +87,8 @@ def load_phoneme_libraries(target_sr=44100):
                     libraries['boy'][name_key] = audio
                 except: pass
     else:
-        print(f"[ATTENTION] Dossier BOY introuvable : {VOICES_DIR_BOY}")
+        print(f"[ATTENTION] Dossier BOY introuvable sur le serveur : {VOICES_DIR_BOY}")
 
-    # Chargement Bibliothèque Filles
     if os.path.exists(VOICES_DIR_GIRL):
         for file in os.listdir(VOICES_DIR_GIRL):
             if file.lower().endswith(valid_extensions):
@@ -79,15 +98,13 @@ def load_phoneme_libraries(target_sr=44100):
                     libraries['girl'][name_key] = audio
                 except: pass
     else:
-        print(f"[ATTENTION] Dossier GIRL introuvable : {VOICES_DIR_GIRL}")
+        print(f"[ATTENTION] Dossier GIRL introuvable sur le serveur : {VOICES_DIR_GIRL}")
         
     print(f"[SUCCÈS] Phonèmes chargés : {len(libraries['boy'])} Garçon | {len(libraries['girl'])} Fille")
     return libraries
 
 def reduce_vowels(text):
-    vowels = "aeiouyàâäéèêëîïôöùûü"
     words = re.split(r'(\W+)', text) 
-    
     reduced = []
     for word in words:
         if not word.strip() or not any(c.isalpha() for c in word):
@@ -97,7 +114,7 @@ def reduce_vowels(text):
         vowel_count = 0
         new_word = []
         for char in word:
-            if char.lower() in vowels:
+            if char.lower() in VOWELS:
                 vowel_count += 1
                 if vowel_count <= 2:
                     new_word.append(char)
@@ -107,8 +124,29 @@ def reduce_vowels(text):
         reduced.append("".join(new_word))
     return "".join(reduced)
 
-def tokenize_text(text, available_keys):
-    text = reduce_vowels(text.lower())
+def get_fallback_phoneme(char, available_keys):
+    for key in available_keys:
+        if key.startswith(char):
+            return key
+            
+    sub = PHONETIC_FALLBACKS.get(char)
+    if sub:
+        if sub in available_keys:
+            return sub
+        for key in available_keys:
+            if key.startswith(sub):
+                return key
+                
+    if 'a' in available_keys: return 'a'
+    return list(available_keys)[0] if available_keys else None
+
+def tokenize_text(text, available_keys, is_slow=False):
+    text = text.lower()
+    text = re.sub(r'([a-zàâäéèêëîïôöùûüç])\1+', r'\1', text)
+    
+    if not is_slow:
+        text = reduce_vowels(text)
+        
     tokens = []
     i = 0
     while i < len(text):
@@ -133,49 +171,100 @@ def tokenize_text(text, available_keys):
                     break
                     
         if not matched:
+            if char.isalpha():
+                fallback = get_fallback_phoneme(char, available_keys)
+                if fallback:
+                    tokens.append(('PHONEME', fallback))
             i += 1
+            
     return tokens
 
-def analyze_intonation_contexts(tokens):
-    contexts = []
-    current_mood = '.'
-    for token_type, value in reversed(tokens):
-        if token_type == 'PUNC': current_mood = value
-        contexts.append(current_mood)
-    contexts.reverse()
-    return contexts
-
-def get_dynamic_pitch(idx, total_tokens, mood, base_character_pitch):
-    progress = idx / max(1, total_tokens - 1)
+def analyze_phrases(tokens, is_slow):
+    meta = []
+    melody_steps = [-0.05, 0.0, 0.05, 0.1, 0.12]
+    current_melody_offset = random.choice(melody_steps)
+    words_until_change = random.randint(0, 2)
+    current_word_count = 0
     
-    macro_arc = 0.08 * np.sin(progress * np.pi) - 0.03
-    micro_bounce = 0.06 * np.sin(idx * 2.5) + 0.03 * np.cos(idx * 1.2)
+    phrases = []
+    current_phrase = []
     
-    end_arc = 0
-    if progress > 0.85:
-        end_progress = (progress - 0.85) / 0.15
-        if mood == '?': end_arc = end_progress * 0.40
-        elif mood == '!': end_arc = end_progress * 0.10
-        else: end_arc = -(end_progress * 0.10)
+    if is_slow:
+        for token_type, value in tokens:
+            current_phrase.append((token_type, value))
+            if token_type == 'PUNC':
+                phrases.append(current_phrase)
+                current_phrase = []
+        if current_phrase:
+            phrases.append(current_phrase)
+    else:
+        phrases = [tokens]
+        
+    for phrase in phrases:
+        mood = '.'
+        if is_slow:
+            if phrase and phrase[-1][0] == 'PUNC':
+                mood = phrase[-1][1]
+        else:
+            for token_type, value in reversed(phrase):
+                if token_type == 'PUNC':
+                    mood = value
+                    break
+        
+        last_vowel_idx = -1
+        for i in range(len(phrase) - 1, -1, -1):
+            t_type, t_val = phrase[i]
+            if t_type == 'PHONEME' and has_vowel(t_val):
+                last_vowel_idx = i
+                break
+                
+        phrase_len = max(1, len(phrase) - 1)
+        for i, (t_type, t_val) in enumerate(phrase):
+            progress = i / phrase_len
+            is_last_vowel = (i == last_vowel_idx)
             
-    phrase_modifier = 1.0 + macro_arc + end_arc
-    return (base_character_pitch * phrase_modifier) + micro_bounce
+            if t_type == 'SPACE':
+                current_word_count += 1
+                if current_word_count >= words_until_change:
+                    available_steps = [m for m in melody_steps if m != current_melody_offset]
+                    current_melody_offset = random.choice(available_steps)
+                    current_word_count = 0
+                    words_until_change = random.randint(1, 3)
+            
+            meta.append((mood, progress, is_last_vowel, current_melody_offset))
+            
+    return meta
 
-def generate_animalese_v31(text, library, base_pitch, speed_factor, sample_rate=44100):
-    tokens = tokenize_text(text, library.keys())
+def get_dynamic_pitch(global_idx, phrase_progress, mood, is_last_vowel, melody_offset, base_character_pitch):
+    end_arc = 0
+    if is_last_vowel:
+        if mood == '?': end_arc = 0.40      
+        elif mood == '!': end_arc = 0.15    
+        elif mood == ',': end_arc = 0.05    
+        else: end_arc = -0.15               
+            
+    phrase_modifier = 1.0 + melody_offset + end_arc
+    phrase_modifier = max(0.4, min(phrase_modifier, 2.5))
+    
+    return base_character_pitch * phrase_modifier
+
+def generate_animalese_v31(text, library, base_pitch, speed_factor, is_slow=False, sample_rate=44100):
+    tokens = tokenize_text(text, library.keys(), is_slow)
     if not tokens: return np.zeros(100, dtype=np.int16)
         
-    mood_contexts = analyze_intonation_contexts(tokens)
+    phrase_meta = analyze_phrases(tokens, is_slow)
     audio_triggers = []
     current_sample_idx = 0
     
     space_samples = int(SPACE_DURATION_SECS * sample_rate)
     punc_samples = int(PUNC_DURATION_SECS * sample_rate)
+    current_overlap = 0.0 if is_slow else OVERLAP_FACTOR
     
     for idx, (token_type, value) in enumerate(tokens):
         if token_type == 'PHONEME':
             raw_audio = library[value]
-            current_pitch = get_dynamic_pitch(idx, len(tokens), mood_contexts[idx], base_pitch)
+            mood, progress, is_last_vowel, melody_offset = phrase_meta[idx]
+            current_pitch = get_dynamic_pitch(idx, progress, mood, is_last_vowel, melody_offset, base_pitch)
             
             duration_samples = int(len(raw_audio) / max(0.1, speed_factor))
             if duration_samples <= 0: continue
@@ -191,7 +280,7 @@ def generate_animalese_v31(text, library, base_pitch, speed_factor, sample_rate=
                 processed_audio *= window
                 
             audio_triggers.append((current_sample_idx, processed_audio))
-            current_sample_idx += int(len(processed_audio) * (1.0 - max(0.0, min(0.99, OVERLAP_FACTOR))))
+            current_sample_idx += int(len(processed_audio) * (1.0 - max(0.0, min(0.99, current_overlap))))
             
         elif token_type == 'SPACE': current_sample_idx += space_samples
         elif token_type == 'PUNC': current_sample_idx += punc_samples
@@ -214,13 +303,14 @@ def clean_filename_part(text):
     words = text.split()
     return "_".join(words[:4])
 
-
+# ==============================================================================
+# INTERFACE WEB (FLASK) & INITIALISATION GLOBALE
+# ==============================================================================
 app = Flask(__name__)
 
-# Chargement global pour que Gunicorn (serveur de prod) initialise les voix au démarrage
-print("--- CHARGEMENT DES BANQUES AUDIO ---")
+# Chargement effectué de manière globale pour que le serveur WSGI (Gunicorn) l'exécute
+print("--- CHARGEMENT DES VOIX EN COURS ---")
 phoneme_libs = load_phoneme_libraries(44100)
-print("--- BANQUES CHARGÉES ---")
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -263,11 +353,11 @@ HTML_TEMPLATE = """
         <div class="radio-group">
             <label class="radio-option">
                 <input type="radio" name="speed" value="fast" checked>
-                ⚡ Rapide (Style Série)
+                ⚡ Rapide
             </label>
             <label class="radio-option">
                 <input type="radio" name="speed" value="slow">
-                🐢 Lent (Style Jeu Original)
+                🐢 Lent
             </label>
         </div>
 
@@ -343,17 +433,16 @@ def api_generate():
     text = data.get('text', '')
     speed_mode = data.get('speed', 'fast')
     
-    # Récupération des données du personnage
     char_info = CHARACTERS.get(character_name, {"pitch": 1.0, "gender": "boy"})
     pitch_val = char_info["pitch"]
     gender = char_info["gender"]
-    speed_factor = SPEED_FAST if speed_mode == 'fast' else SPEED_SLOW
     
-    # Sélection de la bonne bibliothèque de phonèmes
+    is_slow = (speed_mode == 'slow')
+    speed_factor = SPEED_SLOW if is_slow else SPEED_FAST
+    
     library_to_use = phoneme_libs.get(gender, phoneme_libs.get('boy', {}))
     
-    # Génération
-    final_signal = generate_animalese_v31(text, library_to_use, pitch_val, speed_factor, 44100)
+    final_signal = generate_animalese_v31(text, library_to_use, pitch_val, speed_factor, is_slow, 44100)
     
     wav_io = io.BytesIO()
     wavfile.write(wav_io, 44100, final_signal)
@@ -365,16 +454,15 @@ def api_generate():
     
     response = send_file(wav_io, mimetype="audio/wav")
     response.headers["x-filename"] = filename
-    response.headers["Access-Control-Expose-Headers"] = "x-filename"
     return response
 
 if __name__ == "__main__":
     print("=======================================================")
-    print("--- DÉMARRAGE DU SERVEUR DE PRODUCTION ANIMALESE ---")
+    print("--- DÉMARRAGE DU SERVEUR LOCAL ANIMALESE STUDIO ---")
     print("=======================================================\n")
     
-
+    # Récupération dynamique du port (indispensable pour les hébergeurs cloud)
     port = int(os.environ.get("PORT", 5000))
     
-
+    # Host 0.0.0.0 pour exposer le serveur au réseau extérieur
     app.run(host='0.0.0.0', port=port, debug=False)
