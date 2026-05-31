@@ -6,9 +6,6 @@ from scipy.io import wavfile
 import librosa
 from flask import Flask, request, send_file, render_template_string
 
-# ==============================================================================
-# CONFIGURATION DES CHEMINS (Adapté pour un serveur web)
-# ==============================================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VOICES_DIR_BOY = os.path.join(BASE_DIR, "voices", "BOY")
 VOICES_DIR_GIRL = os.path.join(BASE_DIR, "voices", "GIRL")
@@ -20,9 +17,7 @@ OVERLAP_FACTOR = 0.5
 SPACE_DURATION_SECS = 0.015
 PUNC_DURATION_SECS = 0.08
 
-# ==============================================================================
-# BASE DE DONNÉES DES PERSONNAGES
-# ==============================================================================
+
 CHARACTERS = {
     "Tom Nook": {"pitch": 1.11, "gender": "boy"},
     "Amiral": {"pitch": 1.05, "gender": "boy"},
@@ -56,9 +51,7 @@ CHARACTERS = {
     "Shaki": {"pitch": 1.00, "gender": "girl"}
 }
 
-# ==============================================================================
-# FONCTIONS AUDIO
-# ==============================================================================
+
 def load_phoneme_libraries(target_sr=44100):
     """ Charge séparément les dossiers BOY et GIRL en RAM """
     libraries = {'boy': {}, 'girl': {}}
@@ -221,9 +214,7 @@ def clean_filename_part(text):
     words = text.split()
     return "_".join(words[:4])
 
-# ==============================================================================
-# INTERFACE WEB (FLASK) & INITIALISATION
-# ==============================================================================
+
 app = Flask(__name__)
 
 # Chargement global pour que Gunicorn (serveur de prod) initialise les voix au démarrage
@@ -382,8 +373,8 @@ if __name__ == "__main__":
     print("--- DÉMARRAGE DU SERVEUR DE PRODUCTION ANIMALESE ---")
     print("=======================================================\n")
     
-    # Récupère le port du serveur web (ou 5000 par défaut en local)
+
     port = int(os.environ.get("PORT", 5000))
     
-    # Lancement de l'application exposée sur le réseau
+
     app.run(host='0.0.0.0', port=port, debug=False)
